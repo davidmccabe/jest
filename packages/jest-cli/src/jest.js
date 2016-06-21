@@ -4,8 +4,12 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree. An additional grant
  * of patent rights can be found in the PATENTS file in the same directory.
+ *
+ * @flow
  */
 'use strict';
+
+import type {Path} from 'types/Config';
 
 require('jest-haste-map').fastpath.replace();
 
@@ -14,21 +18,19 @@ const fs = require('graceful-fs');
 fs.gracefulify(realFs);
 
 const TestRunner = require('./TestRunner');
+const SearchSource = require('./SearchSource');
 
+const Runtime = require('jest-runtime');
 const chalk = require('chalk');
-const constants = require('./constants');
 const formatTestResults = require('./lib/formatTestResults');
 const os = require('os');
 const path = require('path');
-const readConfig = require('./config/read');
+const readConfig = require('jest-config').readConfig;
 const sane = require('sane');
 const which = require('which');
-const changedFiles = require('jest-changed-files');
-
-const git = changedFiles.git;
-const hg = changedFiles.hg;
 
 const CLEAR = '\x1B[2J\x1B[H';
+const VERSION = require('../package.json').version;
 const WATCHER_DEBOUNCE = 200;
 const WATCHMAN_BIN = 'watchman';
 
@@ -43,42 +45,6 @@ function getMaxWorkers(argv) {
   }
 }
 
-function getTestPaths(testRunner, config, patternInfo) {
-  if (patternInfo.onlyChanged) {
-    return findOnlyChangedTestPaths(testRunner, config);
-  } else {
-    return testRunner.promiseTestPathsMatching(patternInfo.pattern);
-  }
-}
-
-function findOnlyChangedTestPaths(testRunner, config) {
-  return Promise.all(config.testPathDirs.map(determineSCM))
-    .then(repos => {
-      if (!repos.every(result => result[0] || result[1])) {
-        throw new Error(
-          'It appears that one of your testPathDirs does not exist ' +
-          'within a git or hg repository. Currently `--onlyChanged` ' +
-          'only works with git or hg projects.'
-        );
-      }
-      return Promise.all(Array.from(repos).map(repo => {
-        return repo[0]
-          ? git.findChangedFiles(repo[0])
-          : hg.findChangedFiles(repo[1]);
-      }));
-    })
-    .then(changedPathSets => testRunner.promiseTestPathsRelatedTo(
-      new Set(Array.prototype.concat.apply([], changedPathSets))
-    ));
-}
-
-function determineSCM(path) {
-  return Promise.all([
-    git.isGitRepository(path),
-    hg.isHGRepository(path),
-  ]);
-}
-
 function buildTestPathPatternInfo(argv) {
   if (argv.onlyChanged) {
     return {
@@ -89,46 +55,22 @@ function buildTestPathPatternInfo(argv) {
   if (argv.testPathPattern) {
     return {
       input: argv.testPathPattern,
-      pattern: argv.testPathPattern,
+      testPathPattern: argv.testPathPattern,
       shouldTreatInputAsPattern: true,
     };
   }
   if (argv._ && argv._.length) {
     return {
       input: argv._.join(' '),
-      pattern: argv._.join('|'),
+      testPathPattern: argv._.join('|'),
       shouldTreatInputAsPattern: false,
     };
   }
   return {
     input: '',
-    pattern: '',
+    testPathPattern: '',
     shouldTreatInputAsPattern: false,
   };
-}
-
-function getNoTestsFoundMessage(patternInfo) {
-  if (patternInfo.onlyChanged) {
-    const guide = patternInfo.watch
-      ? 'starting Jest with `jest --watch=all`'
-      : 'running Jest without `-o`';
-    return 'No tests found related to changed and uncommitted files.\n' +
-    'Note: If you are using dynamic `require`-calls or no tests related ' +
-    'to your changed files can be found, consider ' + guide + '.';
-  }
-  const pattern = patternInfo.pattern;
-  const input = patternInfo.input;
-  const shouldTreatInputAsPattern = patternInfo.shouldTreatInputAsPattern;
-
-  const formattedPattern = `/${pattern}/`;
-  const formattedInput = shouldTreatInputAsPattern ?
-    `/${input}/` :
-    `"${input}"`;
-
-  const message = `No tests found for ${formattedInput}.`;
-  return input === pattern ?
-    message :
-    `${message} Regex used while searching: ${formattedPattern}.`;
 }
 
 function getWatcher(config, packageRoot, callback) {
@@ -141,23 +83,25 @@ function getWatcher(config, packageRoot, callback) {
 }
 
 function runJest(config, argv, pipe, onComplete) {
-  if (argv.silent) {
-    config.silent = true;
-  }
-  const testRunner = new TestRunner(config, {
-    maxWorkers: getMaxWorkers(argv),
-  });
   const patternInfo = buildTestPathPatternInfo(argv);
-  return getTestPaths(testRunner, config, patternInfo)
-    .then(testPaths => {
-      if (!testPaths.length) {
-        pipe.write(`${getNoTestsFoundMessage(patternInfo)}\n`);
+  const maxWorkers = getMaxWorkers(argv);
+  const hasteMap = Runtime.buildHasteMap(config, {maxWorkers});
+  const source = new SearchSource(hasteMap, config);
+  return source.getTestPaths(patternInfo)
+    .then(data => {
+      if (!data.paths.length) {
+        pipe.write(
+          source.getNoTestsFoundMessage(patternInfo, config, data) + '\n'
+        );
       }
-      return testPaths;
+      return data.paths;
     })
-    .then(testPaths => testRunner.runTests(testPaths))
+    .then(testPaths =>
+      new TestRunner(hasteMap, config, {maxWorkers}).runTests(testPaths)
+    )
     .then(runResults => {
       if (config.testResultsProcessor) {
+        /* $FlowFixMe */
         const processor = require(config.testResultsProcessor);
         processor(runResults);
       }
@@ -184,12 +128,12 @@ function runJest(config, argv, pipe, onComplete) {
     });
 }
 
-function runCLI(argv, root, onComplete) {
+function runCLI(argv: Object, root: Path, onComplete: () => void) {
   const pipe = argv.json ? process.stderr : process.stdout;
 
   argv = argv || {};
   if (argv.version) {
-    pipe.write(`v${constants.VERSION}\n`);
+    pipe.write(`v${VERSION}\n`);
     onComplete && onComplete(true);
     return;
   }
@@ -201,8 +145,9 @@ function runCLI(argv, root, onComplete) {
         chalk.enabled = false;
       }
 
+      /* $FlowFixMe */
       const testFramework = require(config.testRunner);
-      const info = [`v${constants.VERSION}`, testFramework.name];
+      const info = [`v${VERSION}`, testFramework.name];
       if (config.usesBabelJest) {
         info.push('babel-jest');
       }
@@ -214,34 +159,40 @@ function runCLI(argv, root, onComplete) {
           argv.onlyChanged = true;
         }
 
-        getWatcher(config, root, watcher => {
-          let timer;
-          let isRunning;
+        return new Promise(resolve => {
+          getWatcher(config, root, watcher => {
+            let timer;
+            let isRunning;
 
-          pipe.write(CLEAR + header);
-          watcher.on('all', (_, filePath) => {
             pipe.write(CLEAR + header);
-            filePath = path.join(root, filePath);
-            const isValidPath =
-              config.testPathDirs.some(dir => filePath.startsWith(dir));
-            if (!isRunning && isValidPath) {
-              if (timer) {
-                clearTimeout(timer);
-                timer = null;
+            watcher.on('all', (_, filePath) => {
+              pipe.write(CLEAR + header);
+              filePath = path.join(root, filePath);
+              const isValidPath =
+                config.testPathDirs.some(dir => filePath.startsWith(dir));
+              if (!isRunning && isValidPath) {
+                if (timer) {
+                  clearTimeout(timer);
+                  timer = null;
+                }
+                timer = setTimeout(
+                  () => {
+                    isRunning = true;
+                    runJest(config, argv, pipe, () => isRunning = false)
+                      .then(
+                        resolve,
+                        error => console.error(chalk.red(error))
+                      );
+                  },
+                  WATCHER_DEBOUNCE
+                );
               }
-              timer = setTimeout(
-                () => {
-                  isRunning = true;
-                  runJest(config, argv, pipe, () => isRunning = false);
-                },
-                WATCHER_DEBOUNCE
-              );
-            }
+            });
           });
         });
       } else {
         pipe.write(header);
-        runJest(config, argv, pipe, onComplete);
+        return runJest(config, argv, pipe, onComplete);
       }
     })
     .catch(error => {
@@ -250,6 +201,9 @@ function runCLI(argv, root, onComplete) {
     });
 }
 
-exports.TestRunner = TestRunner;
-exports.getVersion = () => constants.VERSION;
-exports.runCLI = runCLI;
+module.exports = {
+  getVersion: () => VERSION,
+  runCLI,
+  SearchSource,
+  TestRunner,
+};
